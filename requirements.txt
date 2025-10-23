@@ -4,3 +4,5 @@ numpy
 requests
 python-dotenv
 nfl_data_py
+pyarrow
+# fastparquet  # optional fallback
