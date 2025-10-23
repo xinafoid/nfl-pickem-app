@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+requests
+python-dotenv
+nfl_data_py
