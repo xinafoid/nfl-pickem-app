@@ -167,66 +167,85 @@ def _agg_pfpa(df):
     return pd.Series({"pf_g": ewma_weighted_mean(pf, w),
                       "pa_g": ewma_weighted_mean(pa, w)})
 
-pfpa = long_pg.groupby("team").apply(_agg_pfpa).reset_index()
+pfpa = long_pg.groupby("team", group_keys=False).apply(_agg_pfpa).reset_index()
 league_avg_pf = float(pfpa["pf_g"].mean())
 
 # ================================================================
-# PBP with EWMA for EPA & Pace
+# PBP with EWMA for EPA & Pace (guard for seasons with no PBP yet)
 # ================================================================
-pbp = nfl.import_pbp_data([SEASON])
-pbp = pbp[pbp["week"] <= train_weeks].copy()
-if "pass" in pbp.columns and pbp["pass"].dtype != bool:
-    pbp["pass"] = pbp["pass"].astype(int)
+try:
+    pbp = nfl.import_pbp_data([SEASON])
+    pbp = pbp[pbp["week"] <= train_weeks].copy()
+except Exception as e:
+    print(f"Warning: PBP not available for {SEASON} (reason: {e}). Proceeding without PBP features.")
+    pbp = pd.DataFrame(columns=["season","week","posteam","defteam","epa","game_id","pass","passer_player_name"])
 
-off_week = (pbp.groupby(["posteam","week"])["epa"].mean()
-            .rename("epa_off_wk").reset_index().rename(columns={"posteam":"team"}))
-def_week = (pbp.groupby(["defteam","week"])["epa"].mean()
-            .rename("epa_def_wk").reset_index().rename(columns={"defteam":"team"}))
-plays_team_game = (pbp.dropna(subset=["game_id"])
-                   .groupby(["game_id","posteam","week"]).size().rename("plays").reset_index()
-                   .rename(columns={"posteam":"team"}))
-pace_week = plays_team_game.groupby(["team","week"])["plays"].mean().rename("pace_wk").reset_index()
+if pbp.empty:
+    # fallback: zero out EPA/pace/QB; keep app working
+    rates = pd.DataFrame({
+        "team": pfpa["team"],
+        "epa_off": 0.0,
+        "epa_def": 0.0,
+        "pace": 60.0
+    })
+    qbform = pd.DataFrame({"team": pfpa["team"], "qb_epa_play": 0.0})
+else:
+    if "pass" in pbp.columns and pbp["pass"].dtype != bool:
+        pbp["pass"] = pbp["pass"].astype(int)
 
-def _ewma_team_metric(df, col, alpha):
-    w = build_ewma_weights(df["week"].to_numpy(), alpha, train_weeks)
-    v = df[col].to_numpy()
-    return ewma_weighted_mean(v, w)
+    off_week = (
+        pbp.groupby(["posteam","week"])["epa"].mean()
+           .rename("epa_off_wk").reset_index().rename(columns={"posteam":"team"})
+    )
+    def_week = (
+        pbp.groupby(["defteam","week"])["epa"].mean()
+           .rename("epa_def_wk").reset_index().rename(columns={"defteam":"team"})
+    )
+    plays_team_game = (
+        pbp.dropna(subset=["game_id"])
+           .groupby(["game_id","posteam","week"]).size().rename("plays").reset_index()
+           .rename(columns={"posteam":"team"})
+    )
+    pace_week = plays_team_game.groupby(["team","week"])["plays"].mean().rename("pace_wk").reset_index()
 
-epa_off = off_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"epa_off_wk", EWMA_ALPHA_EPA)).rename("epa_off")
-epa_def = def_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"epa_def_wk", EWMA_ALPHA_EPA)).rename("epa_def")
-pace    = pace_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"pace_wk",    EWMA_ALPHA_EPA)).rename("pace")
+    def _ewma_team_metric(df, col, alpha):
+        w = build_ewma_weights(df["week"].to_numpy(), EWMA_ALPHA_EPA, train_weeks)
+        v = df[col].to_numpy()
+        return ewma_weighted_mean(v, w)
 
-rates = (pd.DataFrame(epa_off).reset_index()
-         .merge(pd.DataFrame(epa_def).reset_index(), on="team", how="outer")
-         .merge(pd.DataFrame(pace).reset_index(),    on="team", how="outer")
-         .fillna({"epa_off":0.0,"epa_def":0.0,"pace":60.0}))
+    epa_off = off_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"epa_off_wk", EWMA_ALPHA_EPA)).rename("epa_off")
+    epa_def = def_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"epa_def_wk", EWMA_ALPHA_EPA)).rename("epa_def")
+    pace    = pace_week.groupby("team").apply(lambda d: _ewma_team_metric(d,"pace_wk",    EWMA_ALPHA_EPA)).rename("pace")
 
-# ================================================================
-# QB recent form (from PBP only)
-# ================================================================
-def qb_recent_epa_from_pbp(pbp_all: pd.DataFrame, train_wk: int, recent_window: int = RECENT_WEEKS_QB) -> pd.DataFrame:
-    if train_wk <= 0:
-        return pd.DataFrame(columns=["team","qb_epa_play"])
-    p = pbp_all[(pbp_all["season"] == SEASON) & (pbp_all["week"] <= train_wk)].copy()
-    if "pass" in p.columns and p["pass"].dtype != bool:
-        p["pass"] = p["pass"].astype(int)
-    p = p[p["pass"] == 1]
-    min_week = max(0, train_wk - recent_window)
-    p = p[p["week"] > min_week] if recent_window > 0 else p
-    name_col = "passer_player_name" if "passer_player_name" in p.columns else None
-    if name_col is None or p.empty:
-        qb_team = p.groupby("posteam")["epa"].mean().rename("qb_epa_play").reset_index().rename(columns={"posteam":"team"})
-        return qb_team if not qb_team.empty else pd.DataFrame(columns=["team","qb_epa_play"])
-    atts = (p.groupby(["posteam", name_col]).size().rename("atts").reset_index()
-              .sort_values(["posteam","atts"], ascending=[True, False])
-              .groupby("posteam").head(1)
-              .rename(columns={"posteam":"team", name_col:"qb"}))
-    qb_epa = (p.groupby(["posteam", name_col])["epa"].mean()
-              .rename("qb_epa_play").reset_index()
-              .rename(columns={"posteam":"team", name_col:"qb"}))
-    out = atts.merge(qb_epa, on=["team","qb"], how="left")
-    out["qb_epa_play"] = out["qb_epa_play"].fillna(0.0)
-    return out[["team","qb_epa_play"]]
+    rates = (
+        pd.DataFrame(epa_off).reset_index()
+          .merge(pd.DataFrame(epa_def).reset_index(), on="team", how="outer")
+          .merge(pd.DataFrame(pace).reset_index(),    on="team", how="outer")
+          .fillna({"epa_off":0.0,"epa_def":0.0,"pace":60.0})
+    )
+
+    # QB recent form
+    def qb_recent_epa_from_pbp(pbp_all: pd.DataFrame, train_wk: int, recent_window: int = RECENT_WEEKS_QB) -> pd.DataFrame:
+        p = pbp_all[(pbp_all["season"] == SEASON) & (pbp_all["week"] <= train_wk)].copy()
+        if p.empty: return pd.DataFrame({"team": pfpa["team"], "qb_epa_play": 0.0})
+        if "pass" in p.columns and p["pass"].dtype != bool: p["pass"] = p["pass"].astype(int)
+        p = p[p["pass"] == 1]
+        min_week = max(0, train_wk - recent_window)
+        p = p[p["week"] > min_week] if recent_window > 0 else p
+        name_col = "passer_player_name" if "passer_player_name" in p.columns else None
+        if name_col is None or p.empty:
+            qb_team = p.groupby("posteam")["epa"].mean().rename("qb_epa_play").reset_index().rename(columns={"posteam":"team"})
+            return qb_team if not qb_team.empty else pd.DataFrame({"team": pfpa["team"], "qb_epa_play": 0.0})
+        atts = (p.groupby(["posteam", name_col]).size().rename("atts").reset_index()
+                  .sort_values(["posteam","atts"], ascending=[True, False])
+                  .groupby("posteam").head(1)
+                  .rename(columns={"posteam":"team", name_col:"qb"}))
+        qb_epa = (p.groupby(["posteam", name_col])["epa"].mean()
+                  .rename("qb_epa_play").reset_index()
+                  .rename(columns={"posteam":"team", name_col:"qb"}))
+        out = atts.merge(qb_epa, on=["team","qb"], how="left")
+        out["qb_epa_play"] = out["qb_epa_play"].fillna(0.0)
+        return out[["team","qb_epa_play"]]
 
 qbform = qb_recent_epa_from_pbp(pbp, train_weeks, RECENT_WEEKS_QB)
 if qbform.empty:
