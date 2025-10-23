@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """
-NFL Week X Monte Carlo — Auto CSV + D-model + EWMA + Weather + Market Blend
-- Robust to seasons where play-by-play (PBP) parquet isn't available (404/bug)
-- Avoids pandas groupby.apply deprecation
-- Prints clean, aligned table sorted by win prob
-- Exposes a tie-breaker (median total) for EVERY matchup
+NFL Week X Monte Carlo — Deterministic & Streamlit-safe
+- Stable RNG per-game (no flips across environments)
+- Auto CSV + D-model + EWMA + Weather + Market Blend
+- Robust when PBP parquet is unavailable
+- Deprecation-safe groupby/apply, stable sorts
+- Exposes a median-total tiebreaker for every matchup
 
 CLI:
   python pickem.py --season 2025 --week 8 --sims 10000
 """
 
 # ================================================================
-# --- Imports & env/parquet engine hints ---
+# --- Env pinning (TZ, threads, RNG) BEFORE heavy imports ---
 # ================================================================
-import os
+import os, random, time, hashlib
+
+# Pin timezone so week derivations & "today" are identical
+os.environ.setdefault("TZ", "America/New_York")
+try:
+    time.tzset()  # no-op on Windows, fine elsewhere
+except Exception:
+    pass
+
+# Make numerical libs deterministic (avoid thread nondeterminism)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# Global base seed (override with PICKEM_SEED)
+BASE_SEED = int(os.environ.get("PICKEM_SEED", "42"))
+random.seed(BASE_SEED)
+
+# ================================================================
+# --- Imports & parquet engine hints ---
+# ================================================================
 import sys
 import subprocess
 import argparse
@@ -21,27 +43,42 @@ import numpy as np
 import pandas as pd
 import nfl_data_py as nfl
 
-# Prefer fastparquet on Py3.13 if pyarrow wheels aren't available
+# Prefer fastparquet if pyarrow wheels aren’t available in Streamlit
 try:
     import fastparquet  # noqa: F401
     pd.options.io.parquet.engine = "fastparquet"
 except Exception:
-    # If pyarrow is installed, pandas will use it automatically
     pass
+
+pd.options.mode.copy_on_write = True  # safer pandas writes
+
+# Our global Generator (only for non-sim use); sims get per-game RNG
+np.random.seed(BASE_SEED)
+try:
+    RNG_GLOBAL = np.random.default_rng(BASE_SEED)
+except Exception:
+    RNG_GLOBAL = np.random
+
+def game_rng(season: int, week: int, away: str, home: str):
+    """Deterministic per-game RNG, independent of call order."""
+    key = f"{season}|{week}|{away}@{home}|{BASE_SEED}".encode("utf-8")
+    h = hashlib.sha256(key).digest()
+    # Take first 8 bytes as little-endian unsigned seed
+    seed = int.from_bytes(h[:8], "little", signed=False)
+    return np.random.default_rng(seed)
 
 # ================================================================
 # --- CLI & config knobs ---
 # ================================================================
 parser = argparse.ArgumentParser()
-parser.add_argument("--season", type=int, default=2025)
-parser.add_argument("--week", type=int, default=8)
-parser.add_argument("--sims", type=int, default=10_000)
+parser.add_argument("--season", type=int, default=int(os.environ.get("PICKEM_SEASON", "2025")))
+parser.add_argument("--week",   type=int, default=int(os.environ.get("PICKEM_WEEK",   "8")))
+parser.add_argument("--sims",   type=int, default=int(os.environ.get("PICKEM_SIMS",   "10000")))
 args = parser.parse_args()
 
 SEASON = args.season
 TARGET_WEEK = args.week
 N_SIMS = args.sims
-RANDOM_SEED = 42
 
 # Model knobs
 HOME_FIELD_POINTS = 1.5
@@ -55,22 +92,26 @@ W_MARKET, W_MODEL = 0.60, 0.40
 EWMA_ALPHA_EPA  = 0.50   # EPA + Pace (recent weeks matter more)
 EWMA_ALPHA_PFPA = 0.35   # PF/PA smoother
 
-# Weather knobs (applied only if weather CSV present)
-WIND_THRESHOLD = 12                # mph; below this, no wind penalty
-WIND_PENALTY_PER_MPH = 0.15        # pts per team per mph above threshold
-PRECIP_PENALTY = 0.8               # flat pts per team if precip truthy
-DOME_TAGS = {"DOME"}               # no weather impact
-RETRACTABLE_TAGS = {"RETRACTABLE"} # treat like outdoor unless you edit
+# Weather knobs
+WIND_THRESHOLD = 12
+WIND_PENALTY_PER_MPH = 0.15
+PRECIP_PENALTY = 0.8
+DOME_TAGS = {"DOME"}
+RETRACTABLE_TAGS = {"RETRACTABLE"}  # treat as outdoor unless you customize
 
-np.random.seed(RANDOM_SEED)
+# Team code normalization (prevents pivot/merge misses)
+TEAM_CODE_FIX = {
+    "JAC": "JAX", "LA": "LAR", "STL": "LAR",
+    "WAS": "WSH", "OAK": "LV",  "SD": "LAC",
+}
+def norm_team(t: str) -> str:
+    return TEAM_CODE_FIX.get(str(t).strip().upper(), str(t).strip().upper())
 
 # ================================================================
 # --- Utilities ---
 # ================================================================
 def ensure_csvs(file_stem: str, season: int, week: int):
-    """
-    If market/weather CSVs are missing, call helper scripts to generate them.
-    """
+    """If market/weather CSVs are missing, call helper scripts to generate them."""
     market_csv  = f"{file_stem}_market.csv"
     weather_csv = f"{file_stem}_weather.csv"
 
@@ -135,6 +176,12 @@ ensure_csvs(file_stem, SEASON, TARGET_WEEK)
 
 print(f"Loading schedules for {SEASON}...")
 sched = nfl.import_schedules([SEASON])
+
+# Normalize team codes right away
+for col in ("home_team", "away_team"):
+    if col in sched.columns:
+        sched[col] = sched[col].map(norm_team)
+
 completed = sched.dropna(subset=["home_score","away_score"]).copy()
 if completed.empty:
     raise SystemExit("No completed games found for this season yet.")
@@ -146,17 +193,27 @@ train = completed[completed["week"] <= train_weeks].copy()
 if train.empty:
     train = completed.copy()
 
+# Stable sort (mergesort) whenever we sort
+def stable_sort(df: pd.DataFrame, by):
+    return df.sort_values(by=by, kind="mergesort").reset_index(drop=True)
+
 # ================================================================
 # --- Market & Weather CSVs (optional) ---
 # ================================================================
+def _read_csv_lower(path):
+    df = pd.read_csv(path)
+    df.columns = [c.lower() for c in df.columns]
+    return df
+
 market_df = None
 market_path = f"{file_stem}_market.csv"
 if os.path.exists(market_path):
     try:
-        tmp = pd.read_csv(market_path)
-        cols = {c.lower() for c in tmp.columns}
-        if {"away","home","spread_home","total"}.issubset(cols):
-            tmp.columns = [c.lower() for c in tmp.columns]
+        tmp = _read_csv_lower(market_path)
+        if {"away","home","spread_home","total"}.issubset(tmp.columns):
+            # Normalize codes
+            tmp["home"] = tmp["home"].map(norm_team)
+            tmp["away"] = tmp["away"].map(norm_team)
             market_df = tmp[["away","home","spread_home","total"]].copy()
     except Exception as e:
         print("Warning: could not read market CSV:", e)
@@ -165,10 +222,10 @@ weather_df = None
 weather_path = f"{file_stem}_weather.csv"
 if os.path.exists(weather_path):
     try:
-        w = pd.read_csv(weather_path)
-        cols = {c.lower() for c in w.columns}
-        if {"away","home","wind_mph","precip","roof"}.issubset(cols):
-            w.columns = [c.lower() for c in w.columns]
+        w = _read_csv_lower(weather_path)
+        if {"away","home","wind_mph","precip","roof"}.issubset(w.columns):
+            w["home"] = w["home"].map(norm_team)
+            w["away"] = w["away"].map(norm_team)
             weather_df = w[["away","home","wind_mph","precip","roof"]].copy()
     except Exception as e:
         print("Warning: could not read weather CSV:", e)
@@ -183,6 +240,7 @@ away_g = train[["week","away_team","away_score","home_score"]].rename(
     columns={"away_team":"team","away_score":"pf","home_score":"pa"}
 )
 long_pg = pd.concat([home_g, away_g], ignore_index=True)
+long_pg["team"] = long_pg["team"].map(norm_team)
 weights_pfpa = build_ewma_weights(long_pg["week"].to_numpy(), EWMA_ALPHA_PFPA, train_weeks)
 long_pg["w"] = weights_pfpa
 
@@ -194,8 +252,8 @@ def _agg_pfpa(df):
     pa_g = ewma_weighted_mean(pa, w)
     return pd.Series({"pf_g": pf_g, "pa_g": pa_g})
 
-# NOTE: group_keys=False silences the future deprecation
-pfpa = long_pg.groupby("team", group_keys=False).apply(_agg_pfpa).reset_index()
+pfpa = long_pg.groupby("team", group_keys=False, sort=False).apply(_agg_pfpa).reset_index()
+pfpa = stable_sort(pfpa, ["team"])
 league_avg_pf = float(pfpa["pf_g"].mean())
 
 # ================================================================
@@ -214,6 +272,9 @@ def qb_recent_epa_from_pbp(pbp_all: pd.DataFrame, season: int, train_wk: int, re
     if p.empty:
         return pd.DataFrame({"team": pfpa["team"], "qb_epa_play": 0.0})
 
+    p["posteam"] = p["posteam"].map(norm_team)
+    p["defteam"] = p["defteam"].map(norm_team)
+
     if "pass" in p.columns and p["pass"].dtype != bool:
         p["pass"] = p["pass"].astype(int)
     p = p[p["pass"] == 1]
@@ -230,6 +291,7 @@ def qb_recent_epa_from_pbp(pbp_all: pd.DataFrame, season: int, train_wk: int, re
         qb_team = p.groupby("posteam")["epa"].mean().rename("qb_epa_play").reset_index().rename(columns={"posteam":"team"})
         if qb_team.empty:
             return pd.DataFrame({"team": pfpa["team"], "qb_epa_play": 0.0})
+        qb_team["team"] = qb_team["team"].map(norm_team)
         return qb_team
 
     atts = (
@@ -244,26 +306,20 @@ def qb_recent_epa_from_pbp(pbp_all: pd.DataFrame, season: int, train_wk: int, re
          .rename(columns={"posteam":"team", name_col:"qb"})
     )
     out = atts.merge(qb_epa, on=["team","qb"], how="left")
+    out["team"] = out["team"].map(norm_team)
     out["qb_epa_play"] = out["qb_epa_play"].fillna(0.0)
     return out[["team","qb_epa_play"]]
 
 def build_rates_from_pbp(pbp_all: pd.DataFrame, train_wk: int) -> pd.DataFrame:
     if pbp_all is None or pbp_all.empty or train_wk <= 0:
-        return pd.DataFrame({
-            "team": pfpa["team"],
-            "epa_off": 0.0,
-            "epa_def": 0.0,
-            "pace": 60.0
-        })
+        return pd.DataFrame({"team": pfpa["team"], "epa_off": 0.0, "epa_def": 0.0, "pace": 60.0})
 
     pbp_use = pbp_all[pbp_all["week"] <= train_wk].copy()
     if pbp_use.empty:
-        return pd.DataFrame({
-            "team": pfpa["team"],
-            "epa_off": 0.0,
-            "epa_def": 0.0,
-            "pace": 60.0
-        })
+        return pd.DataFrame({"team": pfpa["team"], "epa_off": 0.0, "epa_def": 0.0, "pace": 60.0})
+
+    pbp_use["posteam"] = pbp_use["posteam"].map(norm_team)
+    pbp_use["defteam"] = pbp_use["defteam"].map(norm_team)
 
     if "pass" in pbp_use.columns and pbp_use["pass"].dtype != bool:
         pbp_use["pass"] = pbp_use["pass"].astype(int)
@@ -293,10 +349,11 @@ def build_rates_from_pbp(pbp_all: pd.DataFrame, train_wk: int) -> pd.DataFrame:
           .merge(pd.DataFrame(pace).reset_index(),    on="team", how="outer")
           .fillna({"epa_off":0.0, "epa_def":0.0, "pace":60.0})
     )
+    out["team"] = out["team"].map(norm_team)
     out = pfpa[["team"]].merge(out, on="team", how="left").fillna({"epa_off":0.0,"epa_def":0.0,"pace":60.0})
-    return out
+    return stable_sort(out, ["team"])
 
-# Try to import PBP (nfl_data_py may 404 / bug on Py3.13)
+# Try to import PBP (nfl_data_py may 404/bug)
 try:
     pbp = nfl.import_pbp_data([SEASON])
 except Exception as e:
@@ -317,6 +374,8 @@ if qbform.empty:
 week_df = sched[sched["week"] == TARGET_WEEK].copy()
 if week_df.empty:
     raise SystemExit(f"No schedule entries found for week {TARGET_WEEK} in {SEASON}.")
+for col in ("home_team", "away_team"):
+    week_df[col] = week_df[col].map(norm_team)
 
 # ================================================================
 # --- Modeling helpers (points, market, weather, sims) ---
@@ -356,12 +415,24 @@ def blend_with_market(home, away, model_home, model_away, market_df):
         return model_home, model_away, None, None, None
     row = market_df[(market_df["home"] == home) & (market_df["away"] == away)]
     if row.empty:
-        return model_home, model_away, None, None, None
-    try:
-        spread_home = float(row["spread_home"].iloc[0])  # negative = home favored
-        total = float(row["total"].iloc[0])
-    except Exception:
-        return model_home, model_away, None, None, None
+        # If the market feed accidentally swapped sides for this row, try swapped match
+        row = market_df[(market_df["home"] == away) & (market_df["away"] == home)]
+        if row.empty:
+            return model_home, model_away, None, None, None
+        # Interpret spread_home relative to *reported* home; if sides were swapped,
+        # invert spread to align with our actual home team
+        try:
+            spread_home = -float(row["spread_home"].iloc[0])  # invert
+            total = float(row["total"].iloc[0])
+        except Exception:
+            return model_home, model_away, None, None, None
+    else:
+        try:
+            spread_home = float(row["spread_home"].iloc[0])  # negative = home favored
+            total = float(row["total"].iloc[0])
+        except Exception:
+            return model_home, model_away, None, None, None
+
     market_home = (total + (-spread_home)) / 2.0
     market_away = total - market_home
     home_pts = W_MARKET*market_home + W_MODEL*model_home
@@ -373,7 +444,14 @@ def apply_weather_adjustment(home, away, lam_home, lam_away, weather_df):
         return lam_home, lam_away, ""
     row = weather_df[(weather_df["home"] == home) & (weather_df["away"] == away)]
     if row.empty:
-        return lam_home, lam_away, ""
+        # Handle swapped rows defensively
+        row = weather_df[(weather_df["home"] == away) & (weather_df["away"] == home)]
+        if row.empty:
+            return lam_home, lam_away, ""
+        swapped = True
+    else:
+        swapped = False
+
     roof = str(row["roof"].iloc[0]).strip().upper() if pd.notna(row["roof"].iloc[0]) else "OUTDOOR"
     wind = float(row["wind_mph"].iloc[0]) if pd.notna(row["wind_mph"].iloc[0]) else 0.0
     precip = str(row["precip"].iloc[0]).strip().lower() if pd.notna(row["precip"].iloc[0]) else ""
@@ -396,17 +474,20 @@ def apply_weather_adjustment(home, away, lam_home, lam_away, weather_df):
     new_home = max(6.0, lam_home + adj_home)
     new_away = max(6.0, lam_away + adj_away)
     wx_note = "" if not note_bits else " | Weather: " + ", ".join(note_bits)
+    if swapped:
+        wx_note += " | (feed sides swapped)"
     return new_home, new_away, wx_note
 
-def simulate_scores(lambda_home: float, lambda_away: float, n_sims: int = 10_000):
-    home_scores = np.random.poisson(lam=lambda_home, size=n_sims)
-    away_scores = np.random.poisson(lam=lambda_away, size=n_sims)
+def simulate_scores(lambda_home: float, lambda_away: float, n_sims: int, rng: np.random.Generator):
+    home_scores = rng.poisson(lam=lambda_home, size=n_sims)
+    away_scores = rng.poisson(lam=lambda_away, size=n_sims)
     home_wins = (home_scores > away_scores)
     away_wins = (away_scores > home_scores)
     ties = ~(home_wins | away_wins)
-    coin = np.random.rand(ties.sum()) < 0.5
-    home_wins[ties] = coin
-    away_wins[ties] = ~coin
+    if ties.any():
+        coin = rng.random(ties.sum()) < 0.5
+        home_wins[ties] = coin
+        away_wins[ties] = ~coin
     totals = home_scores + away_scores
     return {
         "home_win_pct": float(home_wins.mean()*100.0),
@@ -431,7 +512,7 @@ def edge_text(favored, home, away, lam_home, lam_away, favored_win, spread_home,
     return f"{label}: {margin_text}{market_note(spread_home)}{wx_note}"
 
 # ================================================================
-# --- Simulate each matchup ---
+# --- Simulate each matchup (deterministic per game) ---
 # ================================================================
 rows = []
 for _, g in week_df.iterrows():
@@ -441,7 +522,7 @@ for _, g in week_df.iterrows():
     # Model points (EPA + PF/PA + QB + Pace + HFA)
     model_home, model_away = expected_points_from_components(home, away)
 
-    # Market blend if file present
+    # Market blend if file present (defensive to swapped rows)
     lam_home, lam_away, mkt_home, mkt_away, spread_home = blend_with_market(
         home, away, model_home, model_away, market_df
     )
@@ -449,8 +530,11 @@ for _, g in week_df.iterrows():
     # Weather adjustment if file present
     lam_home, lam_away, wx_note = apply_weather_adjustment(home, away, lam_home, lam_away, weather_df)
 
+    # Deterministic RNG per matchup → identical results across environments
+    rng = game_rng(SEASON, TARGET_WEEK, away, home)
+
     # Simulate
-    sim = simulate_scores(lam_home, lam_away, n_sims=N_SIMS)
+    sim = simulate_scores(lam_home, lam_away, n_sims=N_SIMS, rng=rng)
     home_win = round(sim["home_win_pct"], 1)
     away_win = round(sim["away_win_pct"], 1)
     favored, favored_win = (home, home_win) if home_win >= away_win else (away, away_win)
@@ -485,7 +569,7 @@ for _, g in week_df.iterrows():
 
 df = pd.DataFrame(rows)
 
-# Sort by confidence
+# Sort by confidence (stable)
 df = df.sort_values(by="Favored Win %", ascending=False, kind="mergesort").reset_index(drop=True)
 
 # Final columns + formatting
@@ -510,7 +594,7 @@ fmt = {
     "Total Mean": "{:.1f}".format,
 }
 
-print(f"\n=== NFL Week {TARGET_WEEK} — {SEASON} (Auto CSV + D-model + EWMA + Weather, {N_SIMS} sims) ===")
+print(f"\n=== NFL Week {TARGET_WEEK} — {SEASON} (Deterministic, Auto CSV + D-model + EWMA + Weather, {N_SIMS} sims) ===")
 print(df.to_string(index=False, formatters=fmt))
 
 out_path = f"{file_stem}_D_model_{SEASON}.csv"
