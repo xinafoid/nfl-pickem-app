@@ -73,7 +73,7 @@ def game_rng(season: int, week: int, away: str, home: str):
 parser = argparse.ArgumentParser()
 parser.add_argument("--season", type=int, default=int(os.environ.get("PICKEM_SEASON", "2025")))
 parser.add_argument("--week",   type=int, default=int(os.environ.get("PICKEM_WEEK",   "8")))
-parser.add_argument("--sims",   type=int, default=int(os.environ.get("PICKEM_SIMS",   "10000")))
+parser.add_argument("--sims",   type=int, default=int(os.environ.get("PICKEM_SIMS",   "1000000")))
 args = parser.parse_args()
 
 SEASON = args.season
